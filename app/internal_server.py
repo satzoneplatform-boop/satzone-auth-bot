@@ -20,8 +20,6 @@ from __future__ import annotations
 
 import asyncio
 import secrets
-import time
-from collections import defaultdict, deque
 
 import structlog
 from aiogram import Bot
@@ -29,39 +27,14 @@ from aiogram.exceptions import TelegramAPIError
 from aiohttp import web
 
 from app.config import settings
+from app.rate_limit import RateLimiter
 
 logger = structlog.get_logger("bot.internal_server")
 
 _INTERNAL_SECRET_HEADER = "X-Internal-Secret"
 
 _BOT_KEY: web.AppKey[Bot] = web.AppKey("bot", Bot)
-
-
-class _RateLimiter:
-    """Per-key sliding-window rate limiter.
-
-    Cheap and in-memory; sufficient for a single-instance bot. Each key gets a
-    deque of recent timestamps; we drop ones outside the window on every check.
-    """
-
-    def __init__(self, max_per_window: int, window_seconds: float = 60.0) -> None:
-        self._max = max_per_window
-        self._window = window_seconds
-        self._buckets: dict[int, deque[float]] = defaultdict(deque)
-
-    def allow(self, key: int) -> bool:
-        now = time.monotonic()
-        bucket = self._buckets[key]
-        cutoff = now - self._window
-        while bucket and bucket[0] <= cutoff:
-            bucket.popleft()
-        if len(bucket) >= self._max:
-            return False
-        bucket.append(now)
-        return True
-
-
-_RATE_LIMITER_KEY: web.AppKey[_RateLimiter] = web.AppKey("rate_limiter", _RateLimiter)
+_RATE_LIMITER_KEY: web.AppKey[RateLimiter] = web.AppKey("rate_limiter", RateLimiter)
 
 
 def _is_authorised(request: web.Request) -> bool:
@@ -125,7 +98,7 @@ def build_internal_app(bot: Bot) -> web.Application:
     """Build the aiohttp application, wiring shared state for handlers to use."""
     app = web.Application()
     app[_BOT_KEY] = bot
-    app[_RATE_LIMITER_KEY] = _RateLimiter(max_per_window=settings.OTP_RATE_LIMIT_PER_MIN)
+    app[_RATE_LIMITER_KEY] = RateLimiter(max_per_window=settings.OTP_RATE_LIMIT_PER_MIN)
     app.add_routes(
         [
             web.get("/healthz", _handle_healthz),

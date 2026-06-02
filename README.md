@@ -42,8 +42,9 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
 Tunables (`LOG_LEVEL`, `HTTP_TIMEOUT_SECONDS`, `LINK_STATE_TTL_SECONDS`,
-`OTP_RATE_LIMIT_PER_MIN`) have safe defaults; see `.env.example` for the
-shipped values.
+`OTP_RATE_LIMIT_PER_MIN`, `CONTACT_RATE_LIMIT_MAX`,
+`CONTACT_RATE_LIMIT_WINDOW_SECONDS`) have safe defaults; see `.env.example`
+for the shipped values.
 
 ## Network isolation
 
@@ -59,8 +60,12 @@ the shared API key but should not be exposed publicly.
   external state (e.g. Redis) before scaling out.
 - **Graceful shutdown.** `SIGTERM` and `SIGINT` stop polling, close the
   internal HTTP server, drain in-flight retries, and close both HTTP pools.
-- **Rate limiting.** OTP pushes are capped per chat (`OTP_RATE_LIMIT_PER_MIN`)
-  to keep a misbehaving backend from tripping Telegram flood limits.
+- **Rate limiting.** OTP pushes from the API are capped per chat
+  (`OTP_RATE_LIMIT_PER_MIN`) to keep a misbehaving backend from tripping
+  Telegram flood limits. User-initiated OTP requests (contact shares) are
+  capped separately per chat (`CONTACT_RATE_LIMIT_MAX` per
+  `CONTACT_RATE_LIMIT_WINDOW_SECONDS`, default 3 per 5 min) so a user can't
+  spam the backend with fresh-code requests.
 
 ## Run
 

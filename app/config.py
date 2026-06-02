@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     HTTP_TIMEOUT_SECONDS: float = Field(default=10.0, gt=0.0, le=60.0)
     LINK_STATE_TTL_SECONDS: float = Field(default=900.0, gt=0.0)
     OTP_RATE_LIMIT_PER_MIN: int = Field(default=10, ge=1)
+    # Per-chat limit on user-initiated OTP requests (contact shares). Stops a
+    # user (or stolen chat) from spamming the backend with fresh-code requests.
+    CONTACT_RATE_LIMIT_MAX: int = Field(default=3, ge=1)
+    CONTACT_RATE_LIMIT_WINDOW_SECONDS: float = Field(default=300.0, gt=0.0)
 
 
 @lru_cache

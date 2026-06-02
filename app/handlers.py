@@ -34,6 +34,7 @@ from aiogram.types import (
 
 from app.api_client import ApiClient, ApiClientError
 from app.config import settings
+from app.rate_limit import RateLimiter
 
 logger = structlog.get_logger("bot.handlers")
 
@@ -75,6 +76,14 @@ class _LinkStateStore:
 
 
 _link_state_store = _LinkStateStore(ttl_seconds=settings.LINK_STATE_TTL_SECONDS)
+
+# Per-chat throttle for user-initiated OTP requests. Counts every contact-share
+# attempt (success OR failure) so a misbehaving client can't bypass the limit
+# by deliberately triggering API errors.
+_otp_request_limiter = RateLimiter(
+    max_per_window=settings.CONTACT_RATE_LIMIT_MAX,
+    window_seconds=settings.CONTACT_RATE_LIMIT_WINDOW_SECONDS,
+)
 
 
 def _share_phone_keyboard() -> ReplyKeyboardMarkup:
@@ -139,6 +148,23 @@ async def handle_contact(message: Message, api_client: ApiClient) -> None:
         return
 
     chat_id = message.chat.id
+
+    if not _otp_request_limiter.allow(chat_id):
+        retry_seconds = int(_otp_request_limiter.retry_after(chat_id))
+        minutes = max(1, (retry_seconds + 59) // 60)
+        logger.info(
+            "handle_contact.rate_limited",
+            chat_id=chat_id,
+            retry_seconds=retry_seconds,
+        )
+        await message.answer(
+            "You've requested a verification code too many times. "
+            f"Please wait about {minutes} minute{'s' if minutes != 1 else ''} "
+            "before trying again.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
     state = _link_state_store.pop(chat_id)
     try:
         result = await api_client.link_contact(

@@ -14,7 +14,7 @@ WORKDIR /app
 
 # Install dependencies first (declared in pyproject) for better layer caching,
 # then the project itself.
-COPY pyproject.toml ./
+COPY pyproject.toml README.md ./
 COPY app ./app
 RUN pip install .
 
