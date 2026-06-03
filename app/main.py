@@ -66,9 +66,9 @@ async def _run_polling(bot: Bot, dispatcher: Dispatcher, stop_event: asyncio.Eve
         stop_event.set()
 
 
-async def _run_internal_server(stop_event: asyncio.Event, bot: Bot) -> None:
+async def _run_internal_server(stop_event: asyncio.Event) -> None:
     """Serve the internal endpoints until ``stop_event`` is set."""
-    app = build_internal_app(bot)
+    app = build_internal_app()
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host=settings.INTERNAL_HOST, port=settings.INTERNAL_PORT)
@@ -131,7 +131,7 @@ async def _amain() -> None:
         name="polling",
     )
     server_task = asyncio.create_task(
-        _run_internal_server(stop_event, bot),
+        _run_internal_server(stop_event),
         name="internal-server",
     )
     stop_task = asyncio.create_task(stop_event.wait(), name="stop")

@@ -27,22 +27,20 @@ class Settings(BaseSettings):
 
     # ---- Backend API ----
     API_BASE_URL: AnyHttpUrl
-    # API key shared with the backend; sent as the `X-Internal-Secret` header.
-    # Must match the API's TELEGRAM_INTERNAL_SECRET. Required to be reasonably
+    # API key shared with the backend; sent as the `X-Internal-API-Key` header.
+    # Must match the backend's INTERNAL_API_KEY. Required to be reasonably
     # long to make brute-force impractical.
-    INTERNAL_SECRET: str = Field(min_length=16)
+    INTERNAL_API_KEY: str = Field(min_length=16)
 
-    # ---- Internal OTP-push server (the API POSTs codes here) ----
+    # ---- Internal HTTP server (just /healthz now; no inbound OTP push) ----
     INTERNAL_HOST: str = "0.0.0.0"  # noqa: S104 - bind all interfaces inside the container network
     INTERNAL_PORT: int = Field(default=8081, ge=1, le=65535)
 
     # ---- Operational tuning ----
     LOG_LEVEL: str = Field(default="INFO", pattern="^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$")
     HTTP_TIMEOUT_SECONDS: float = Field(default=10.0, gt=0.0, le=60.0)
-    LINK_STATE_TTL_SECONDS: float = Field(default=900.0, gt=0.0)
-    OTP_RATE_LIMIT_PER_MIN: int = Field(default=10, ge=1)
-    # Per-chat limit on user-initiated OTP requests (contact shares). Stops a
-    # user (or stolen chat) from spamming the backend with fresh-code requests.
+    # Per-chat throttle for user-initiated OTP requests (contact shares). Stops
+    # a user (or stolen chat) from spamming the backend with fresh-code requests.
     CONTACT_RATE_LIMIT_MAX: int = Field(default=3, ge=1)
     CONTACT_RATE_LIMIT_WINDOW_SECONDS: float = Field(default=300.0, gt=0.0)
 

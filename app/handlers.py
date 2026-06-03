@@ -5,8 +5,11 @@ Two interactions matter:
 - ``/start`` greets the user and shows a one-tap "Share phone number" button
   (a ``request_contact`` keyboard button — the only reliable way to obtain a
   *verified* phone number from Telegram).
-- A **contact** message → call the API to link ``chat_id`` ↔ ``phone`` ↔ user,
-  then reply with the returned code and instructions to enter it on the website.
+- A **contact** message → look up the user by phone:
+
+    * If a verified user already exists → greet them by name. Done.
+    * Otherwise → mint a fresh OTP via the API and show it. The user types it
+      on the website to finish verification.
 
 The router pulls its :class:`ApiClient` from the dispatcher's workflow data
 (injected in ``main``) rather than constructing one per update, so the HTTP
@@ -20,11 +23,9 @@ number as plain text is routed to the fallback handler.
 
 from __future__ import annotations
 
-import time
-
 import structlog
 from aiogram import F, Router
-from aiogram.filters import CommandObject, CommandStart
+from aiogram.filters import CommandStart
 from aiogram.types import (
     KeyboardButton,
     Message,
@@ -32,50 +33,15 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 
-from app.api_client import ApiClient, ApiClientError
+from app.api_client import ApiClient, ApiClientError, PhoneTakenError
 from app.config import settings
 from app.rate_limit import RateLimiter
 
 logger = structlog.get_logger("bot.handlers")
 
-router = Router(name="link-contact")
+router = Router(name="phone-verify")
 
 _SHARE_PHONE_LABEL = "📱 Share phone number"
-
-
-class _LinkStateStore:
-    """In-memory store for deep-link ``state`` values with per-entry TTL.
-
-    A logged-in user starting from ``t.me/<bot>?start=<state>`` arrives with a
-    payload that the API needs to tie this chat to their account. We keep the
-    state for ``LINK_STATE_TTL_SECONDS`` and prune lazily on every access so
-    abandoned flows don't leak memory.
-
-    In-memory is fine for a single long-polling instance; switch to Redis if
-    the bot ever needs to run multiple replicas.
-    """
-
-    def __init__(self, ttl_seconds: float) -> None:
-        self._ttl = ttl_seconds
-        self._data: dict[int, tuple[str, float]] = {}
-
-    def put(self, chat_id: int, state: str) -> None:
-        self._prune()
-        self._data[chat_id] = (state, time.monotonic() + self._ttl)
-
-    def pop(self, chat_id: int) -> str | None:
-        self._prune()
-        entry = self._data.pop(chat_id, None)
-        return entry[0] if entry else None
-
-    def _prune(self) -> None:
-        now = time.monotonic()
-        expired = [k for k, (_, exp) in self._data.items() if exp <= now]
-        for key in expired:
-            self._data.pop(key, None)
-
-
-_link_state_store = _LinkStateStore(ttl_seconds=settings.LINK_STATE_TTL_SECONDS)
 
 # Per-chat throttle for user-initiated OTP requests. Counts every contact-share
 # attempt (success OR failure) so a misbehaving client can't bypass the limit
@@ -97,20 +63,12 @@ def _share_phone_keyboard() -> ReplyKeyboardMarkup:
 
 
 @router.message(CommandStart())
-async def handle_start(message: Message, command: CommandObject) -> None:
-    """Greet the user and prompt them to share their phone number.
-
-    A deep-link payload (``/start <state>``) means a logged-in user is linking
-    from the app; remember it for this chat so the contact share can be tied
-    back to their account.
-    """
-    if command.args:
-        _link_state_store.put(message.chat.id, command.args)
-
+async def handle_start(message: Message) -> None:
+    """Greet the user and prompt them to share their phone number."""
     first_name = message.from_user.first_name if message.from_user else "there"
     await message.answer(
         f"Hi {first_name}! 👋\n\n"
-        "This is the SAT Zone verification bot. To receive your login codes here, "
+        "This is the SAT Zone verification bot. To receive your login code here, "
         "tap the button below to share your phone number.\n\n"
         "We only use it to match your Telegram account to your SAT Zone profile.",
         reply_markup=_share_phone_keyboard(),
@@ -119,7 +77,7 @@ async def handle_start(message: Message, command: CommandObject) -> None:
 
 @router.message(F.contact)
 async def handle_contact(message: Message, api_client: ApiClient) -> None:
-    """Handle a shared contact: link it via the API and relay the returned code.
+    """Handle a shared contact: look up the user, then either greet or issue an OTP.
 
     Rejects anything that isn't a genuine Telegram-verified contact for the
     sender's own number (forwarded contact cards carry a ``user_id`` that
@@ -165,49 +123,66 @@ async def handle_contact(message: Message, api_client: ApiClient) -> None:
         )
         return
 
-    state = _link_state_store.pop(chat_id)
+    phone = contact.phone_number
+
+    # Step 1: returning verified user? Greet and stop.
     try:
-        result = await api_client.link_contact(
-            chat_id=chat_id,
-            phone=contact.phone_number,
-            first_name=contact.first_name,
-            last_name=contact.last_name,
-            state=state,
-        )
+        user = await api_client.lookup_user_by_phone(phone)
     except ApiClientError:
-        logger.warning("handle_contact.link_failed", chat_id=chat_id)
+        logger.warning("handle_contact.lookup_failed", chat_id=chat_id)
         await message.answer(
-            "Sorry, something went wrong linking your account. "
-            "Please try again in a moment, or contact support if it keeps happening.",
+            "Sorry, something went wrong. Please try again in a moment.",
             reply_markup=ReplyKeyboardRemove(),
         )
         return
 
-    if result.get("linked"):
-        logger.info("handle_contact.linked_account", chat_id=chat_id)
+    if user is not None and user.get("is_phone_verified"):
+        full_name = (user.get("full_name") or "").strip() or "there"
+        logger.info("handle_contact.returning_user", chat_id=chat_id)
         await message.answer(
-            "✅ Your Telegram is now linked to your SAT Zone account!\n\n"
-            "You'll receive verification codes here. You can return to the website.",
+            f"Welcome back, <b>{full_name}</b>! 👋\n\n"
+            "Your phone is already linked to your SAT Zone account. "
+            "You can sign in on the website any time.",
             reply_markup=ReplyKeyboardRemove(),
         )
         return
 
-    code = result.get("code")
-    if not code:
-        logger.error("handle_contact.missing_code", chat_id=chat_id)
+    # Step 2: new (or unverified) user → mint a fresh OTP and show it.
+    try:
+        result = await api_client.issue_otp(phone)
+    except PhoneTakenError:
+        logger.info("handle_contact.phone_taken", chat_id=chat_id)
         await message.answer(
-            "Your number is linked, but we couldn't generate a code right now. "
-            "Please request a new code from the website.",
+            "This phone number is already verified on another SAT Zone account.\n\n"
+            "Please log in to that account, or use a different number.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+    except ApiClientError:
+        logger.warning("handle_contact.issue_otp_failed", chat_id=chat_id)
+        await message.answer(
+            "Sorry, something went wrong issuing your code. "
+            "Please try again in a moment.",
             reply_markup=ReplyKeyboardRemove(),
         )
         return
 
-    logger.info("handle_contact.linked", chat_id=chat_id)
+    otp = result.get("otp")
+    if not otp:
+        logger.error("handle_contact.missing_otp", chat_id=chat_id)
+        await message.answer(
+            "We couldn't generate a code right now. Please try again shortly.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+
+    minutes = max(1, int(result.get("expires_in", 0)) // 60)
+    logger.info("handle_contact.otp_issued", chat_id=chat_id)
     await message.answer(
-        "✅ Your phone number is linked!\n\n"
-        f"Your SAT Zone verification code is:\n\n<b>{code}</b>\n\n"
-        "Enter it on the website to finish signing in. "
-        "The code is valid for a few minutes — don't share it with anyone.",
+        "✅ Your phone number is verified!\n\n"
+        f"Your SAT Zone verification code is:\n\n<code>{otp}</code>\n\n"
+        f"Enter it on the website within {minutes} minutes to finish signing in. "
+        "Don't share it with anyone.",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -216,8 +191,8 @@ async def handle_contact(message: Message, api_client: ApiClient) -> None:
 async def handle_fallback(message: Message) -> None:
     """Nudge users who type free-text toward the share-phone flow."""
     await message.answer(
-        "To link your account, tap the button below to share your phone number. "
-        "Typed numbers aren't accepted — Telegram has to send the verified "
+        "To get your verification code, tap the button below to share your phone "
+        "number. Typed numbers aren't accepted — Telegram has to send the verified "
         "contact for us. If you don't see the button, send /start.",
         reply_markup=_share_phone_keyboard(),
     )

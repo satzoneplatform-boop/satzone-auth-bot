@@ -1,11 +1,17 @@
 """HTTP client for the SAT Zone backend API.
 
-The bot owns no database. To link a Telegram contact to a user it calls the
-API's internal endpoint, authenticating with the shared ``INTERNAL_SECRET``
-API key. This thin wrapper around a single long-lived
-:class:`httpx.AsyncClient` keeps the contract (URL, header, payload shape) in
-one place and raises a typed :class:`ApiClientError` on any failure so handlers
-can show friendly copy.
+The bot owns no database. To handle a phone share it makes two calls to the
+backend's internal endpoints, authenticated with the shared ``INTERNAL_API_KEY``
+sent as ``X-Internal-API-Key``:
+
+1. ``POST /api/v1/internal/users/lookup-by-phone`` — does a user already exist
+   for this phone? If yes and verified, the bot greets them and stops.
+2. ``POST /api/v1/internal/phone/issue-otp`` — otherwise, mint an OTP and show
+   it to the user.
+
+This thin wrapper around a single long-lived :class:`httpx.AsyncClient` keeps
+the contract (URL, header, payload shape) in one place and raises typed
+exceptions on failure so handlers can show friendly copy.
 
 Transport failures are retried with exponential backoff; HTTP errors (4xx/5xx)
 are not — the API's response is authoritative.
@@ -24,8 +30,9 @@ from app.config import settings
 
 logger = structlog.get_logger("bot.api_client")
 
-_LINK_CONTACT_PATH = "/api/v1/auth/telegram/link-contact"
-_INTERNAL_SECRET_HEADER = "X-Internal-Secret"
+_LOOKUP_PATH = "/api/v1/internal/users/lookup-by-phone"
+_ISSUE_OTP_PATH = "/api/v1/internal/phone/issue-otp"
+_INTERNAL_API_KEY_HEADER = "X-Internal-API-Key"
 
 # Retry policy for transient transport errors. HTTP status errors are never
 # retried — the API is authoritative on those.
@@ -38,7 +45,11 @@ _MAX_LOGGED_BODY = 512
 
 
 class ApiClientError(Exception):
-    """Raised when the API call fails (network error or non-2xx response)."""
+    """Raised when the API call fails (network error or unexpected non-2xx)."""
+
+
+class PhoneTakenError(ApiClientError):
+    """Raised on 409 ``phone_taken`` — the phone is verified on another account."""
 
 
 class ApiClient:
@@ -47,71 +58,95 @@ class ApiClient:
     def __init__(self) -> None:
         self._client = httpx.AsyncClient(
             base_url=str(settings.API_BASE_URL).rstrip("/"),
-            headers={_INTERNAL_SECRET_HEADER: settings.INTERNAL_SECRET},
+            headers={_INTERNAL_API_KEY_HEADER: settings.INTERNAL_API_KEY},
             timeout=httpx.Timeout(settings.HTTP_TIMEOUT_SECONDS),
         )
 
-    async def link_contact(
-        self,
-        *,
-        chat_id: int,
-        phone: str,
-        first_name: str | None,
-        last_name: str | None,
-        state: str | None = None,
-    ) -> dict[str, Any]:
-        """Link a Telegram contact to a user.
+    async def lookup_user_by_phone(self, phone: str) -> dict[str, Any] | None:
+        """Return the user record for ``phone`` or ``None`` if no user exists.
 
-        Returns the API's JSON body — sign-in mode: ``{"code", "expires_in"}``;
-        link mode (``state`` set): ``{"linked": true}``. Raises
-        :class:`ApiClientError` on transport failure (after retries) or any
-        non-2xx status.
+        404 with code ``user_not_found`` is the expected "new user" signal and
+        returns ``None`` rather than raising. Other non-2xx → :class:`ApiClientError`.
         """
-        payload = {
-            "chat_id": chat_id,
-            "phone": phone,
-            "first_name": first_name,
-            "last_name": last_name,
-            "state": state,
-        }
+        try:
+            response = await self._request_with_retry(
+                _LOOKUP_PATH, {"phone_number": phone}
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                logger.info("lookup.not_found")
+                return None
+            self._log_status_error("lookup", exc)
+            raise ApiClientError("API rejected the lookup request") from exc
 
+        data: dict[str, Any] = response.json()
+        logger.info("lookup.ok", verified=bool(data.get("is_phone_verified")))
+        return data
+
+    async def issue_otp(self, phone: str) -> dict[str, Any]:
+        """Mint a fresh OTP for ``phone``. Returns ``{otp, expires_in}``.
+
+        Raises :class:`PhoneTakenError` on 409 (number owned by another account)
+        and :class:`ApiClientError` on any other failure.
+        """
+        try:
+            response = await self._request_with_retry(
+                _ISSUE_OTP_PATH, {"phone_number": phone}
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 409:
+                logger.info("issue_otp.phone_taken")
+                raise PhoneTakenError("phone already verified on another account") from exc
+            self._log_status_error("issue_otp", exc)
+            raise ApiClientError("API rejected the issue-otp request") from exc
+
+        data: dict[str, Any] = response.json()
+        # NB: never log the OTP itself.
+        logger.info("issue_otp.ok", expires_in=data.get("expires_in"))
+        return data
+
+    async def _request_with_retry(
+        self, path: str, payload: dict[str, Any]
+    ) -> httpx.Response:
+        """POST ``payload`` to ``path``, retrying transport errors only.
+
+        HTTP status errors propagate so the caller can map specific codes to
+        typed exceptions.
+        """
         for attempt in range(_RETRY_ATTEMPTS):
             try:
-                response = await self._client.post(_LINK_CONTACT_PATH, json=payload)
+                response = await self._client.post(path, json=payload)
                 response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                logger.warning(
-                    "link_contact.api_error",
-                    chat_id=chat_id,
-                    status_code=exc.response.status_code,
-                    body=exc.response.text[:_MAX_LOGGED_BODY],
-                )
-                raise ApiClientError("API rejected the link request") from exc
+            except httpx.HTTPStatusError:
+                # Authoritative — never retry. Re-raise for the caller to map.
+                raise
             except httpx.HTTPError as exc:
                 if attempt < _RETRY_ATTEMPTS - 1:
                     backoff = _RETRY_BACKOFFS[attempt]
                     logger.info(
-                        "link_contact.retry",
-                        chat_id=chat_id,
+                        "api.retry",
+                        path=path,
                         attempt=attempt + 1,
                         backoff=backoff,
                         error=str(exc),
                     )
                     await asyncio.sleep(backoff)
                     continue
-                logger.warning(
-                    "link_contact.transport_error",
-                    chat_id=chat_id,
-                    error=str(exc),
-                )
+                logger.warning("api.transport_error", path=path, error=str(exc))
                 raise ApiClientError("Could not reach the API") from exc
             else:
-                data: dict[str, Any] = response.json()
-                logger.info("link_contact.ok", chat_id=chat_id)
-                return data
+                return response
 
         # Loop only exits via return or raise; this is for the type checker.
         raise ApiClientError("Could not reach the API")
+
+    @staticmethod
+    def _log_status_error(op: str, exc: httpx.HTTPStatusError) -> None:
+        logger.warning(
+            f"{op}.api_error",
+            status_code=exc.response.status_code,
+            body=exc.response.text[:_MAX_LOGGED_BODY],
+        )
 
     async def aclose(self) -> None:
         """Close the underlying connection pool on shutdown."""
