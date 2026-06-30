@@ -1,0 +1,17 @@
+services:
+  bot:
+    build: .
+    image: satzone-bot:latest
+    container_name: satzone-bot
+    env_file: .env
+    restart: unless-stopped
+    networks:
+      - backend_net
+
+networks:
+  # Attach to the backend's existing Docker network so the bot can reach
+  # the API by its service name (set API_BASE_URL=http://<service>:<port>).
+  # Find the real name with: docker network ls
+  backend_net:
+    external: true
+    name: CHANGE_ME_backend_network_name
